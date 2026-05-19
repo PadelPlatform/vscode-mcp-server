@@ -114,9 +114,12 @@ export function registerShellTools(server: McpServer, terminal?: vscode.Terminal
                     throw new Error('Terminal not available');
                 }
                 
-                // Check for shell integration - wait briefly if not available
+                // PATCH (pp dev open multi-window): show the terminal up front so the shell
+                // process starts (VS Code is lazy until the terminal is visible), and wait
+                // up to 10s for shell integration. The original 1s wait raced the first call.
                 if (!terminal.shellIntegration) {
-                    const shellIntegrationAvailable = await waitForShellIntegration(terminal);
+                    terminal.show(true);
+                    const shellIntegrationAvailable = await waitForShellIntegration(terminal, 10000);
                     if (!shellIntegrationAvailable) {
                         throw new Error('Shell integration not available in terminal');
                     }
@@ -135,6 +138,44 @@ export function registerShellTools(server: McpServer, terminal?: vscode.Terminal
                 return result;
             } catch (error) {
                 console.error('[execute_shell_command] Error in tool:', error);
+                throw error;
+            }
+        }
+    );
+
+    // PATCH (pp): send Ctrl+C to the shared terminal to interrupt a running command.
+    // Useful after execute_shell_command_code times out but the process is still alive.
+    server.tool(
+        'send_terminal_interrupt_code',
+        `Sends Ctrl+C (SIGINT / ETX 0x03) to the MCP shared terminal to interrupt a running command.
+
+        WHEN TO USE: A previous execute_shell_command_code returned a timeout error but the underlying process is still running in the terminal (dev servers, long builds, hung commands). Sends a single Ctrl+C; call again to escalate if the process ignores the first one.
+
+        Does NOT close the terminal — the shell stays alive for further commands.`,
+        {
+            count: z.number().int().min(1).max(5).optional().default(1).describe('Number of Ctrl+C characters to send (default: 1). Use 2-3 for stubborn processes.')
+        },
+        async ({ count = 1 }): Promise<CallToolResult> => {
+            try {
+                if (!terminal) {
+                    throw new Error('Terminal not available');
+                }
+                terminal.show(true);
+                for (let i = 0; i < count; i++) {
+                    // \u0003 (ETX) is what the kernel maps Ctrl+C to. addNewLine=false so it
+                    // goes through as a control byte rather than as a literal command.
+                    terminal.sendText('\u0003', false);
+                }
+                return {
+                    content: [
+                        {
+                            type: 'text',
+                            text: `Sent Ctrl+C x${count} to MCP terminal.`
+                        }
+                    ]
+                };
+            } catch (error) {
+                console.error('[send_terminal_interrupt] Error in tool:', error);
                 throw error;
             }
         }

@@ -15,6 +15,14 @@ let serverEnabled: boolean = false;
 // Terminal name constant
 const TERMINAL_NAME = 'MCP Shell Commands';
 
+// PATCH (pp dev open multi-window): pass workspace identity to MCPServer so its discovery
+// file is keyed to the right window. Falls back to null for windows without a folder.
+function getWorkspaceInfoForMcp(): { name: string; path: string } | null {
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders || folders.length === 0) { return null; }
+    return { name: folders[0].name, path: folders[0].uri.fsPath };
+}
+
 /**
  * Gets the tool configuration from VS Code settings
  * @returns ToolConfiguration object with all tool enablement settings
@@ -47,8 +55,22 @@ export function getExtensionTerminal(context: vscode.ExtensionContext): vscode.T
         return existingTerminal;
     }
     
-    // Create a new terminal if it doesn't exist or if it has exited
-    sharedTerminal = vscode.window.createTerminal(TERMINAL_NAME);
+    // Create a new terminal if it doesn't exist or if it has exited.
+    // PATCH (pp dev open multi-window): force a shell with working shell integration.
+    // Users with `terminal.integrated.defaultProfile.windows` = "Command Prompt" would
+    // otherwise get a cmd.exe terminal that never reports shellIntegration, so every
+    // execute_shell_command_code call fails with "Shell integration not available".
+    // pwsh (PowerShell 7+) if installed, else powershell.exe (5.1, always on Win10/11).
+    let chosenShell: string | undefined;
+    if (process.platform === 'win32') {
+        const pwshCandidates = ['pwsh.exe', 'powershell.exe'];
+        const which = require('child_process').spawnSync('where', [pwshCandidates[0]], { encoding: 'utf8' });
+        chosenShell = (which.status === 0 && which.stdout.trim()) ? pwshCandidates[0] : pwshCandidates[1];
+    }
+    sharedTerminal = vscode.window.createTerminal({
+        name: TERMINAL_NAME,
+        shellPath: chosenShell,
+    });
     logger.info('[getExtensionTerminal] Created new terminal for shell commands');
     context.subscriptions.push(sharedTerminal);
 
@@ -96,7 +118,7 @@ async function toggleServerState(context: vscode.ExtensionContext): Promise<void
             logger.info(`[toggleServerState] Creating MCP server instance`);
             const terminal = getExtensionTerminal(context);
             const toolConfig = getToolConfiguration();
-            mcpServer = new MCPServer(port, host, terminal, toolConfig);
+            mcpServer = new MCPServer(port, host, terminal, toolConfig, getWorkspaceInfoForMcp());
             mcpServer.setFileListingCallback(async (path: string, recursive: boolean) => {
                 try {
                     return await listWorkspaceFiles(path, recursive);
@@ -177,7 +199,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
             // Initialize MCP server with the configured port, terminal, and tool configuration
             const toolConfig = getToolConfiguration();
-            mcpServer = new MCPServer(port, host, terminal, toolConfig);
+            mcpServer = new MCPServer(port, host, terminal, toolConfig, getWorkspaceInfoForMcp());
 
             // Set up file listing callback
             mcpServer.setFileListingCallback(async (path: string, recursive: boolean) => {
@@ -234,7 +256,7 @@ export async function activate(context: vscode.ExtensionContext) {
                     const terminal = getExtensionTerminal(context);
                     const toolConfig = getToolConfiguration();
                     
-                    mcpServer = new MCPServer(port, host, terminal, toolConfig);
+                    mcpServer = new MCPServer(port, host, terminal, toolConfig, getWorkspaceInfoForMcp());
                     mcpServer.setFileListingCallback(async (path: string, recursive: boolean) => {
                         try {
                             return await listWorkspaceFiles(path, recursive);

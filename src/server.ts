@@ -29,15 +29,19 @@ export class MCPServer {
     private fileListingCallback?: FileListingCallback;
     private terminal?: vscode.Terminal;
     private toolConfig: ToolConfiguration;
+    // PATCH (pp dev open multi-window): workspace info + per-port discovery file path
+    private workspaceInfo: { name: string; path: string } | null;
+    private _discoveryFile?: string;
 
     public setFileListingCallback(callback: FileListingCallback) {
         this.fileListingCallback = callback;
     }
 
-    constructor(port: number = 3000, host: string = '127.0.0.1', terminal?: vscode.Terminal, toolConfig?: ToolConfiguration) {
+    constructor(port: number = 3000, host: string = '127.0.0.1', terminal?: vscode.Terminal, toolConfig?: ToolConfiguration, workspaceInfo?: { name: string; path: string } | null) {
         this.port = port;
         this.host = host;
         this.terminal = terminal;
+        this.workspaceInfo = workspaceInfo || null;
         this.toolConfig = toolConfig || {
             file: true,
             edit: true,
@@ -227,19 +231,60 @@ export class MCPServer {
             // Start HTTP server
             logger.info('[MCPServer.start] Starting HTTP server');
             const httpServerStartTime = Date.now();
-            
-            return new Promise((resolve) => {
-                // Bind to localhost only for security
-                this.httpServer = this.app.listen(this.port, this.host, () => {
-                    const httpStartTime = Date.now() - httpServerStartTime;
-                    logger.info(`[MCPServer.start] HTTP Server started (took ${httpStartTime}ms)`);
-                    logger.info(`MCP Server listening on ${this.host}:${this.port}`);
-                    
-                    const totalTime = Date.now() - startTime;
-                    logger.info(`[MCPServer.start] Server startup complete (total: ${totalTime}ms)`);
-                    
-                    resolve();
-                });
+
+            // PATCH (pp dev open multi-window): retry the next port on EADDRINUSE so each
+            // VS Code window can host its own MCP server. Discovery file written after bind
+            // lets external tools (pp dev open) map workspace -> port without convention.
+            const maxAttempts = 10;
+            const basePort = this.port;
+            return new Promise<void>((resolve, reject) => {
+                const tryListen = (attempt: number) => {
+                    if (attempt >= maxAttempts) {
+                        reject(new Error(`MCP server failed to bind any port in [${basePort}, ${basePort + maxAttempts - 1}]`));
+                        return;
+                    }
+                    const candidatePort = basePort + attempt;
+                    const httpServer = this.app.listen(candidatePort, this.host);
+                    const onError = (err: NodeJS.ErrnoException) => {
+                        if (err && err.code === 'EADDRINUSE') {
+                            logger.info(`[MCPServer.start] Port ${candidatePort} in use; trying ${candidatePort + 1}`);
+                            tryListen(attempt + 1);
+                        } else {
+                            reject(err);
+                        }
+                    };
+                    httpServer.once('error', onError);
+                    httpServer.once('listening', () => {
+                        httpServer.removeListener('error', onError);
+                        this.httpServer = httpServer;
+                        this.port = candidatePort;
+                        const httpStartTime = Date.now() - httpServerStartTime;
+                        logger.info(`[MCPServer.start] HTTP Server started (took ${httpStartTime}ms)`);
+                        logger.info(`MCP Server listening on ${this.host}:${this.port}`);
+                        try {
+                            const fs = require('fs');
+                            const os = require('os');
+                            const path = require('path');
+                            const dir = path.join(os.tmpdir(), 'vscode-mcp-server');
+                            fs.mkdirSync(dir, { recursive: true });
+                            this._discoveryFile = path.join(dir, `${this.port}.json`);
+                            fs.writeFileSync(this._discoveryFile, JSON.stringify({
+                                port: this.port,
+                                pid: process.pid,
+                                workspaceName: this.workspaceInfo ? this.workspaceInfo.name : null,
+                                workspacePath: this.workspaceInfo ? this.workspaceInfo.path : null,
+                                startTime: new Date().toISOString(),
+                            }, null, 2));
+                            logger.info(`[MCPServer.start] Wrote discovery file: ${this._discoveryFile}`);
+                        } catch (e) {
+                            logger.warn(`[MCPServer.start] Failed to write discovery file: ${e instanceof Error ? e.message : String(e)}`);
+                        }
+                        const totalTime = Date.now() - startTime;
+                        logger.info(`[MCPServer.start] Server startup complete (total: ${totalTime}ms)`);
+                        resolve();
+                    });
+                };
+                tryListen(0);
             });
         } catch (error) {
             logger.error(`[MCPServer.start] Failed to start MCP Server: ${error instanceof Error ? error.message : String(error)}`);
@@ -250,7 +295,19 @@ export class MCPServer {
     public async stop(forceTimeout: number = 5000): Promise<void> {
         logger.info('[MCPServer.stop] Starting server shutdown process');
         const stopStartTime = Date.now();
-        
+
+        // PATCH (pp dev open multi-window): remove discovery file (best-effort)
+        try {
+            if (this._discoveryFile) {
+                const fs = require('fs');
+                if (fs.existsSync(this._discoveryFile)) { fs.unlinkSync(this._discoveryFile); }
+                logger.info(`[MCPServer.stop] Removed discovery file: ${this._discoveryFile}`);
+                this._discoveryFile = undefined;
+            }
+        } catch (e) {
+            logger.warn(`[MCPServer.stop] Failed to remove discovery file: ${e instanceof Error ? e.message : String(e)}`);
+        }
+
         try {
             // Close HTTP server with timeout
             if (this.httpServer) {
