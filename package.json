@@ -1,11 +1,11 @@
 {
   "name": "vscode-mcp-server",
   "icon": "media/logo.png",
-  "displayName": "vscode-mcp-server",
-  "description": "VS Code as a MCP server",
-  "version": "0.4.0",
-  "repository": "https://github.com/juehang/vscode-mcp-server",
-  "publisher": "JuehangQin",
+  "displayName": "VS Code MCP Server (PadelPlatform fork)",
+  "description": "VS Code as a MCP server — PadelPlatform fork with multi-window discovery, pwsh-forced terminal, and send_terminal_interrupt_code (Ctrl+C) tool.",
+  "version": "0.4.1",
+  "repository": "https://github.com/PadelPlatform/vscode-mcp-server",
+  "publisher": "padelplatform",
   "license": "MIT",
   "engines": {
     "vscode": "^1.99.0"
