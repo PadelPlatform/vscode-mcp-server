@@ -3,6 +3,60 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from 'zod';
 import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
+// PATCH (pp): scrollback capture for the shared MCP terminal.
+//
+// VS Code's stable Terminal API exposes no way to read scrollback. The proposed
+// `terminalDataWriteEvent` API fires for every byte VS Code writes into any
+// terminal — by subscribing and keeping a per-terminal ring buffer we can let
+// read_terminal_buffer_code return "what the user has seen on screen lately",
+// including output from commands they ran themselves (not just commands we
+// dispatched via execute_shell_command_code).
+//
+// Proposed APIs require either the user-data-dir `argv.json` to allow our
+// extension id or VS Code launched with --enable-proposed-api. When the API
+// isn't available we degrade gracefully: the tool still registers but returns
+// an actionable error explaining the setup step. (See README for details.)
+
+const TERMINAL_BUFFER_MAX_BYTES = 1024 * 1024; // 1 MB ≈ ~12k lines post-ANSI-strip.
+
+class RingBuffer {
+    private chunks: string[] = [];
+    private totalBytes = 0;
+    constructor(private readonly maxBytes: number) {}
+
+    write(data: string): void {
+        if (!data) { return; }
+        this.chunks.push(data);
+        this.totalBytes += data.length;
+        // Drop oldest chunks until we're back under cap.
+        while (this.totalBytes > this.maxBytes && this.chunks.length > 1) {
+            const dropped = this.chunks.shift()!;
+            this.totalBytes -= dropped.length;
+        }
+        // Single oversized chunk: trim from the left so we still cap memory.
+        if (this.chunks.length === 1 && this.chunks[0].length > this.maxBytes) {
+            this.chunks[0] = this.chunks[0].slice(-this.maxBytes);
+            this.totalBytes = this.chunks[0].length;
+        }
+    }
+
+    read(): string {
+        return this.chunks.join('');
+    }
+
+    get size(): number {
+        return this.totalBytes;
+    }
+}
+
+// CSI / OSC / single-char escape sequences. Covers cursor moves, colors,
+// hyperlinks, title-set, etc. Good enough for human-readable scrollback.
+const ANSI_ESCAPE_RE = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]/g;
+
+function stripAnsiEscapes(s: string): string {
+    return s.replace(ANSI_ESCAPE_RE, '');
+}
+
 /**
  * Waits briefly for shell integration to become available
  * @param terminal The terminal to wait for
@@ -93,6 +147,27 @@ export async function executeShellCommand(
  * @param terminal The terminal to use for command execution
  */
 export function registerShellTools(server: McpServer, terminal?: vscode.Terminal): void {
+    // PATCH (pp): wire up the terminal-write listener once at registration time.
+    // Subscribing to vscode.window.onDidWriteTerminalData requires the proposed
+    // `terminalDataWriteEvent` API; if it isn't available, capture stays empty
+    // and read_terminal_buffer_code returns an actionable error.
+    const buffer = new RingBuffer(TERMINAL_BUFFER_MAX_BYTES);
+    const onDidWriteTerminalData = (vscode.window as any).onDidWriteTerminalData as
+        | vscode.Event<{ terminal: vscode.Terminal; data: string }>
+        | undefined;
+    let captureEnabled = false;
+    if (typeof onDidWriteTerminalData === 'function' && terminal) {
+        onDidWriteTerminalData((e) => {
+            if (e.terminal === terminal) {
+                buffer.write(e.data);
+            }
+        });
+        captureEnabled = true;
+        console.log('[shell-tools] Terminal scrollback capture enabled (proposed API)');
+    } else {
+        console.warn('[shell-tools] onDidWriteTerminalData not available — terminal scrollback capture disabled. Add the extension id to argv.json `enable-proposed-api` to enable.');
+    }
+
     // Add execute_shell_command tool
     server.tool(
         'execute_shell_command_code',
@@ -176,6 +251,64 @@ export function registerShellTools(server: McpServer, terminal?: vscode.Terminal
                 };
             } catch (error) {
                 console.error('[send_terminal_interrupt] Error in tool:', error);
+                throw error;
+            }
+        }
+    );
+
+    // PATCH (pp): read the shared terminal's recent scrollback from our ring buffer.
+    // Captures *all* bytes VS Code writes to the terminal (commands we ran via
+    // execute_shell_command_code AND commands the user typed into the same
+    // terminal), so this is the way to inspect output that wasn't surfaced by an
+    // execute call — e.g. a dev server's ongoing logs, or a command the user
+    // typed manually.
+    server.tool(
+        'read_terminal_buffer_code',
+        `Returns the most recent output written to the MCP shared terminal from an in-memory ring buffer (capped at 1 MB).
+
+        WHEN TO USE: Inspecting a running dev server's logs, recovering output from a command that timed out, or reading anything the user typed into the same terminal. Captures everything VS Code writes to the terminal, not just commands dispatched through execute_shell_command_code.
+
+        Returns at most maxBytes characters from the END of the buffer (most recent output). Defaults to ANSI-stripped for readability; set stripAnsi=false to get raw bytes.
+
+        Buffer is wiped on extension reload. Capture starts when the MCP server starts; output written before then is not available.`,
+        {
+            maxBytes: z.number().int().min(1).max(1048576).optional().default(1048576).describe('Maximum characters to return from the tail of the buffer (default and ceiling: 1 MB).'),
+            stripAnsi: z.boolean().optional().default(true).describe('Strip ANSI escape sequences (colors, cursor moves, hyperlinks). Default true.')
+        },
+        async ({ maxBytes = TERMINAL_BUFFER_MAX_BYTES, stripAnsi = true }): Promise<CallToolResult> => {
+            try {
+                if (!captureEnabled) {
+                    return {
+                        content: [
+                            {
+                                type: 'text',
+                                text: 'Terminal scrollback capture is disabled — the proposed `terminalDataWriteEvent` API is not exposed to this extension. To enable: add "padelplatform.vscode-mcp-server" to the `enable-proposed-api` array in your VS Code argv.json (Command Palette → "Preferences: Configure Runtime Arguments"), restart VS Code, then reload the window.'
+                            }
+                        ],
+                        isError: true
+                    };
+                }
+
+                let text = buffer.read();
+                const rawBytes = text.length;
+                if (stripAnsi) {
+                    text = stripAnsiEscapes(text);
+                }
+                if (text.length > maxBytes) {
+                    text = text.slice(-maxBytes);
+                }
+                const truncated = rawBytes >= TERMINAL_BUFFER_MAX_BYTES;
+                const header = `Terminal buffer (capture ${rawBytes}B raw / ${TERMINAL_BUFFER_MAX_BYTES}B cap${truncated ? ', trimmed from head' : ''}, returning ${text.length}B${stripAnsi ? ' ANSI-stripped' : ' raw'}):\n`;
+                return {
+                    content: [
+                        {
+                            type: 'text',
+                            text: header + text
+                        }
+                    ]
+                };
+            } catch (error) {
+                console.error('[read_terminal_buffer] Error in tool:', error);
                 throw error;
             }
         }
