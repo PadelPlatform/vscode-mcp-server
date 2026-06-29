@@ -198,6 +198,12 @@ export function registerShellTools(server: McpServer, terminal?: vscode.Terminal
                     if (!shellIntegrationAvailable) {
                         throw new Error('Shell integration not available in terminal');
                     }
+                    // PATCH (pp): PSReadLine first-character-drop race. `shellIntegration`
+                    // becomes available the moment pwsh emits OSC 633 ; A, but PSReadLine's
+                    // input pipeline isn't fully wired yet — so the first keystroke of the
+                    // very next executeCommand gets swallowed ("npm run dev" → "pm run dev").
+                    // 750ms is enough headroom for cold pwsh on this hardware.
+                    await new Promise(resolve => setTimeout(resolve, 750));
                 }
                 
                 const { output } = await executeShellCommand(terminal, command, cwd, timeout);

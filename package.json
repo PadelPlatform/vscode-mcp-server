@@ -3,7 +3,7 @@
   "icon": "media/logo.png",
   "displayName": "VS Code MCP Server (PadelPlatform fork)",
   "description": "VS Code as a MCP server — PadelPlatform fork with multi-window discovery, pwsh-forced terminal, send_terminal_interrupt_code (Ctrl+C), and read_terminal_buffer_code (scrollback ring buffer).",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "repository": "https://github.com/PadelPlatform/vscode-mcp-server",
   "publisher": "padelplatform",
   "license": "MIT",
