@@ -57,6 +57,29 @@ function stripAnsiEscapes(s: string): string {
     return s.replace(ANSI_ESCAPE_RE, '');
 }
 
+// PATCH (pp multi-terminal): a background process = a dedicated named terminal we
+// launched a long-running command into. Tracked so list/read/stop tools can find it.
+interface BackgroundProcess {
+    name: string;
+    terminal: vscode.Terminal;
+    command: string;
+}
+
+// PATCH (pp multi-terminal): pick a shell with working shell integration for the
+// background terminals we create, same rationale as extension.ts's shared terminal —
+// a user whose default profile is cmd.exe would otherwise get a shell that can't run
+// our pwsh-style commands (e.g. `... | Tee-Object log`). pwsh 7+ if present, else
+// Windows PowerShell 5.1 (always on Win10/11). undefined elsewhere = OS default shell.
+function pickShellPath(): string | undefined {
+    if (process.platform !== 'win32') { return undefined; }
+    try {
+        const which = require('child_process').spawnSync('where', ['pwsh.exe'], { encoding: 'utf8' });
+        return (which.status === 0 && String(which.stdout).trim()) ? 'pwsh.exe' : 'powershell.exe';
+    } catch {
+        return 'powershell.exe';
+    }
+}
+
 /**
  * Waits briefly for shell integration to become available
  * @param terminal The terminal to wait for
@@ -151,22 +174,38 @@ export function registerShellTools(server: McpServer, terminal?: vscode.Terminal
     // Subscribing to vscode.window.onDidWriteTerminalData requires the proposed
     // `terminalDataWriteEvent` API; if it isn't available, capture stays empty
     // and read_terminal_buffer_code returns an actionable error.
-    const buffer = new RingBuffer(TERMINAL_BUFFER_MAX_BYTES);
+    // PATCH (pp multi-terminal): one RingBuffer per captured terminal (the shared
+    // terminal AND every background terminal), keyed by Terminal. The single
+    // onDidWriteTerminalData handler routes each write to the matching buffer.
+    const terminalBuffers = new Map<vscode.Terminal, RingBuffer>();
+    const sharedBuffer = new RingBuffer(TERMINAL_BUFFER_MAX_BYTES);
+    if (terminal) { terminalBuffers.set(terminal, sharedBuffer); }
+    // PATCH (pp multi-terminal): registry of background processes by name.
+    const bgProcs = new Map<string, BackgroundProcess>();
+
     const onDidWriteTerminalData = (vscode.window as any).onDidWriteTerminalData as
         | vscode.Event<{ terminal: vscode.Terminal; data: string }>
         | undefined;
     let captureEnabled = false;
-    if (typeof onDidWriteTerminalData === 'function' && terminal) {
+    if (typeof onDidWriteTerminalData === 'function') {
         onDidWriteTerminalData((e) => {
-            if (e.terminal === terminal) {
-                buffer.write(e.data);
-            }
+            const buf = terminalBuffers.get(e.terminal);
+            if (buf) { buf.write(e.data); }
         });
         captureEnabled = true;
         console.log('[shell-tools] Terminal scrollback capture enabled (proposed API)');
     } else {
         console.warn('[shell-tools] onDidWriteTerminalData not available — terminal scrollback capture disabled. Add the extension id to argv.json `enable-proposed-api` to enable.');
     }
+
+    // PATCH (pp multi-terminal): prune the registry when a background terminal is
+    // closed (by us or by the user) so list/read don't dangle on a dead Terminal.
+    vscode.window.onDidCloseTerminal((closed) => {
+        terminalBuffers.delete(closed);
+        for (const [name, proc] of bgProcs) {
+            if (proc.terminal === closed) { bgProcs.delete(name); }
+        }
+    });
 
     // Add execute_shell_command tool
     server.tool(
@@ -295,7 +334,7 @@ export function registerShellTools(server: McpServer, terminal?: vscode.Terminal
                     };
                 }
 
-                let text = buffer.read();
+                let text = sharedBuffer.read();
                 const rawBytes = text.length;
                 if (stripAnsi) {
                     text = stripAnsiEscapes(text);
@@ -317,6 +356,175 @@ export function registerShellTools(server: McpServer, terminal?: vscode.Terminal
                 console.error('[read_terminal_buffer] Error in tool:', error);
                 throw error;
             }
+        }
+    );
+
+    // PATCH (pp multi-terminal): launch a long-running command in its OWN dedicated
+    // visible terminal and return immediately. Unlike execute_shell_command_code (one
+    // shared terminal, blocks on the output stream until timeout), this lets one VS Code
+    // window run many concurrent long-running processes (dev servers, workers), each in
+    // its own named terminal. Pair with read_background_output / list_background_processes /
+    // stop_background_process. The recommended pattern is to tee the command to a log file
+    // so an external watcher can follow it past this process's lifetime.
+    server.tool(
+        'start_background_process',
+        `Launches a long-running command in its OWN dedicated, visible VS Code terminal and returns IMMEDIATELY (non-blocking).
+
+        WHEN TO USE: dev servers, file watchers, queue workers — anything that runs until stopped. Multiple can run at once, each in its own named terminal in the same window. (For short commands that finish and return output, use execute_shell_command_code instead.)
+
+        Companion tools: list_background_processes (status), read_background_output (scrollback), stop_background_process (Ctrl+C + dispose).
+
+        TIP: tee to a log so an external watcher can follow it, e.g. PowerShell:  <cmd> 2>&1 | Tee-Object -FilePath out.log
+
+        Idempotent-ish: if a process with this name is already running its terminal is shown and left untouched (stop it first to relaunch). A name whose previous run's terminal was closed is recreated.`,
+        {
+            name: z.string().describe('Unique handle for this process (e.g. "api", "frontend", "worker"). Used by the companion tools.'),
+            command: z.string().describe('The shell command to launch (runs in a pwsh terminal on Windows).'),
+            cwd: z.string().optional().describe('Working directory. Defaults to the workspace root / terminal default.')
+        },
+        async ({ name, command, cwd }): Promise<CallToolResult> => {
+            const existing = bgProcs.get(name);
+            if (existing && existing.terminal.exitStatus === undefined) {
+                existing.terminal.show(false);
+                return {
+                    content: [{
+                        type: 'text',
+                        text: `Background process '${name}' already has a live terminal; left as-is. Call stop_background_process({name:'${name}'}) first if you want to relaunch.`
+                    }]
+                };
+            }
+            if (existing) {
+                // Previous terminal exited — clean up before recreating.
+                terminalBuffers.delete(existing.terminal);
+                try { existing.terminal.dispose(); } catch { /* already gone */ }
+                bgProcs.delete(name);
+            }
+
+            const term = vscode.window.createTerminal({
+                name: `MCP bg: ${name}`,
+                shellPath: pickShellPath(),
+                cwd
+            });
+            const buf = new RingBuffer(TERMINAL_BUFFER_MAX_BYTES);
+            terminalBuffers.set(term, buf);
+            bgProcs.set(name, { name, terminal: term, command });
+            term.show(false);
+
+            // Give the freshly-spawned shell time to wire up before sending — same
+            // PSReadLine first-character-drop race execute_shell_command_code guards,
+            // but worse here because the shell is cold (just created). 1s headroom.
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            // Non-blocking by design: sendText returns immediately and does NOT need
+            // shell integration (output capture comes from onDidWriteTerminalData).
+            term.sendText(command, true);
+
+            return {
+                content: [{
+                    type: 'text',
+                    text: `Started background process '${name}' in terminal "MCP bg: ${name}".\n`
+                        + `Command: ${command}${cwd ? `\ncwd: ${cwd}` : ''}\n`
+                        + (captureEnabled
+                            ? `Output is being captured — read it with read_background_output({name:'${name}'}).`
+                            : `Scrollback capture is disabled (proposed terminalDataWriteEvent API not enabled) — tee the command to a log file and watch that instead.`)
+                }]
+            };
+        }
+    );
+
+    // PATCH (pp multi-terminal): list background processes + status. NOTE the status
+    // reflects the TERMINAL's shell, not the launched command — a crashed dev server
+    // returns to the pwsh prompt with the terminal still alive, so it reads "running".
+    // The authoritative signal is the process's own output (read_background_output) or
+    // its log file.
+    server.tool(
+        'list_background_processes',
+        `Lists processes started via start_background_process, with their terminal status.
+
+        IMPORTANT: status reflects whether the TERMINAL is alive, not whether the launched command is still running. A command that crashed back to the shell prompt still shows "running" (terminal alive). To confirm the actual process is healthy, read its output (read_background_output) or its log file.`,
+        {},
+        async (): Promise<CallToolResult> => {
+            if (bgProcs.size === 0) {
+                return { content: [{ type: 'text', text: 'No background processes.' }] };
+            }
+            const lines = [...bgProcs.values()].map(p => {
+                const ex = p.terminal.exitStatus;
+                const status = ex === undefined ? 'terminal alive' : `terminal exited (code ${ex.code ?? 'unknown'})`;
+                return `- ${p.name}: ${status} — ${p.command}`;
+            });
+            return { content: [{ type: 'text', text: lines.join('\n') }] };
+        }
+    );
+
+    // PATCH (pp multi-terminal): per-process scrollback (its own RingBuffer).
+    server.tool(
+        'read_background_output',
+        `Returns recent output (in-memory ring buffer, <=1 MB) from a named background process started via start_background_process.
+
+        WHEN TO USE: check a dev server's startup logs, see whether a worker is processing, recover output from a crashed command. Returns the END of the buffer. Defaults to ANSI-stripped; set stripAnsi=false for raw bytes.
+
+        Requires scrollback capture (proposed terminalDataWriteEvent API). If capture is disabled, tee the process to a log file and read that file instead.`,
+        {
+            name: z.string().describe('The process name passed to start_background_process.'),
+            maxBytes: z.number().int().min(1).max(1048576).optional().default(1048576).describe('Max characters from the tail of the buffer (default and ceiling: 1 MB).'),
+            stripAnsi: z.boolean().optional().default(true).describe('Strip ANSI escape sequences. Default true.')
+        },
+        async ({ name, maxBytes = TERMINAL_BUFFER_MAX_BYTES, stripAnsi = true }): Promise<CallToolResult> => {
+            const proc = bgProcs.get(name);
+            if (!proc) {
+                return {
+                    content: [{ type: 'text', text: `No background process named '${name}'. Use list_background_processes to see the live ones.` }],
+                    isError: true
+                };
+            }
+            if (!captureEnabled) {
+                return {
+                    content: [{ type: 'text', text: 'Scrollback capture is disabled — the proposed terminalDataWriteEvent API is not exposed to this extension. Tee the process to a log file and read that file instead. (To enable capture: add "padelplatform.vscode-mcp-server" to enable-proposed-api in argv.json, then restart VS Code.)' }],
+                    isError: true
+                };
+            }
+            const buf = terminalBuffers.get(proc.terminal);
+            let text = buf ? buf.read() : '';
+            const rawBytes = text.length;
+            if (stripAnsi) { text = stripAnsiEscapes(text); }
+            if (text.length > maxBytes) { text = text.slice(-maxBytes); }
+            const ex = proc.terminal.exitStatus;
+            const status = ex === undefined ? 'terminal alive' : `terminal exited (code ${ex.code ?? 'unknown'})`;
+            const header = `[${name}] ${status} — capture ${rawBytes}B raw, returning ${text.length}B${stripAnsi ? ' ANSI-stripped' : ' raw'}:\n`;
+            return { content: [{ type: 'text', text: header + text }] };
+        }
+    );
+
+    // PATCH (pp multi-terminal): stop a background process — Ctrl+C, then (default)
+    // dispose its terminal and forget it. Reuses the same ETX control byte as
+    // send_terminal_interrupt_code.
+    server.tool(
+        'stop_background_process',
+        `Stops a named background process: sends Ctrl+C (twice), then by default disposes its terminal and removes it from the registry.
+
+        WHEN TO USE: shut down a dev server / worker you started with start_background_process. Set dispose=false to only interrupt (Ctrl+C) and keep the terminal around for inspection.`,
+        {
+            name: z.string().describe('The process name passed to start_background_process.'),
+            dispose: z.boolean().optional().default(true).describe('Dispose (close) the terminal after interrupting. Default true; set false to keep it.')
+        },
+        async ({ name, dispose = true }): Promise<CallToolResult> => {
+            const proc = bgProcs.get(name);
+            if (!proc) {
+                return {
+                    content: [{ type: 'text', text: `No background process named '${name}'.` }],
+                    isError: true
+                };
+            }
+            proc.terminal.show(true);
+            // \u0003 (ETX) = Ctrl+C; addNewLine=false so it goes through as a control byte.
+            proc.terminal.sendText('\u0003', false);
+            proc.terminal.sendText('\u0003', false);
+            if (dispose) {
+                terminalBuffers.delete(proc.terminal);
+                try { proc.terminal.dispose(); } catch { /* already gone */ }
+                bgProcs.delete(name);
+                return { content: [{ type: 'text', text: `Stopped and disposed background process '${name}'.` }] };
+            }
+            return { content: [{ type: 'text', text: `Sent Ctrl+C to '${name}' (terminal kept open; still in the registry).` }] };
         }
     );
 }
