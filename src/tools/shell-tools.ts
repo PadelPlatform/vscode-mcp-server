@@ -400,6 +400,26 @@ export function registerShellTools(server: McpServer, terminal?: vscode.Terminal
                 bgProcs.delete(name);
             }
 
+            // PATCH (pp dev open re-run dedup): adopt/clear orphan terminals the
+            // current extension host doesn't track. After a VS Code restart (the
+            // `pp dev open` post-restart workflow), the host starts with an empty
+            // bgProcs map but VS Code's persistent-session feature restores the
+            // previous run's terminal tabs (named "MCP bg: <name>"). Without this
+            // sweep, start_background_process can't see those restored tabs and
+            // creates a *second* same-named terminal — so each `pp dev open` after
+            // a restart accumulates duplicate terminals. Dispose any such orphans
+            // (their shell was killed on shutdown anyway) so we converge on exactly
+            // one terminal per name. Healthy already-running servers are unaffected:
+            // callers (e.g. `pp dev open`) skip the dispatch entirely when the dev
+            // port is already bound, so we never get here for a live server.
+            const dedupName = `MCP bg: ${name}`;
+            for (const t of vscode.window.terminals) {
+                if (t.name === dedupName) {
+                    terminalBuffers.delete(t);
+                    try { t.dispose(); } catch { /* already gone */ }
+                }
+            }
+
             const term = vscode.window.createTerminal({
                 name: `MCP bg: ${name}`,
                 shellPath: pickShellPath(),
